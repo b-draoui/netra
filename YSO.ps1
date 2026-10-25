@@ -195,6 +195,7 @@ $script:UninstallKey  = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninsta
 $script:ReleaseRepo   = 'b-draoui/yso'   # where new versions of YSO are published (GitHub Releases)
 $script:ProjectUrl    = 'https://github.com/' + $script:ReleaseRepo
 $script:UpdateCheckPath = Join-Path $script:DataDir 'yso-version-check.json'
+$script:SelfPath      = $PSCommandPath   # this file: compared with the published one (same version, newer build)
 $script:ErrorLogPath  = Join-Path $script:DataDir 'errors.log'
 $script:OsMajor       = [Environment]::OSVersion.Version.Major
 $script:Build         = [Environment]::OSVersion.Version.Build
@@ -209,6 +210,7 @@ $script:LastEventError = $null
 $script:WingetVersion = $null
 $script:WingetVersionRead = $false
 $script:UpdateMutex   = $null
+$script:WuSession     = $null
 $script:ProgressClock = [System.Diagnostics.Stopwatch]::StartNew()
 $script:ProgressHandler = $null   # set by a graphical interface to receive progress instead of the console
 $script:ProgressParent = -1
@@ -472,6 +474,10 @@ function Get-BatteryHealth {
         $design = [double](@(Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryStaticData -ErrorAction Stop)[0].DesignedCapacity)
         $full   = [double](@(Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryFullChargedCapacity -ErrorAction Stop)[0].FullChargedCapacity)
     } catch { }
+    try {
+        $c = [int](@(Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryCycleCount -ErrorAction Stop)[0].CycleCount)
+        if ($c -gt 0) { $cycles = $c }   # 0 = not counted
+    } catch { }
     if (-not ($design -gt 0 -and $full -gt 0) -and $env:TEMP) {
         $xmlPath = Join-Path $env:TEMP ('yso-battery_{0}.xml' -f [guid]::NewGuid().ToString('N').Substring(0, 6))
         try {
@@ -481,14 +487,30 @@ function Get-BatteryHealth {
                 $bats = @($x.BatteryReport.Batteries.Battery | Where-Object { $_ })
                 $design = [double](($bats | ForEach-Object { [double]"$($_.DesignCapacity)" } | Measure-Object -Sum).Sum)
                 $full   = [double](($bats | ForEach-Object { [double]"$($_.FullChargeCapacity)" } | Measure-Object -Sum).Sum)
-                if ($bats.Count -gt 0 -and "$($bats[0].CycleCount)" -match '^\d+$' -and [int]"$($bats[0].CycleCount)" -gt 0) { $cycles = [int]"$($bats[0].CycleCount)" }   # 0 = not counted
+                if ($null -eq $cycles -and $bats.Count -gt 0 -and "$($bats[0].CycleCount)" -match '^\d+$' -and [int]"$($bats[0].CycleCount)" -gt 0) { $cycles = [int]"$($bats[0].CycleCount)" }   # 0 = not counted
             }
         } catch { } finally { Remove-Item -LiteralPath $xmlPath -Force -ErrorAction SilentlyContinue }
     }
     if ($design -gt 0 -and $full -gt 0) {
-        return [pscustomobject]@{ Design = $design; Full = $full; Percent = [int][math]::Round(100 * $full / $design); Cycles = $cycles }
+        # Reported: what the battery says. Percent: never above 100 (a battery cannot be better than new).
+        $reported = [int][math]::Round(100 * $full / $design)
+        return [pscustomobject]@{ Design = $design; Full = $full; Reported = $reported; Percent = [math]::Min(100, $reported); Cycles = $cycles }
     }
     return $null
+}
+
+function Get-BatteryVerdict($Battery) {
+    # What to say about a battery. Above 100 %: a new battery can hold a little more than its rated
+    # capacity, but after many charge cycles it means the battery's charge gauge is off.
+    $p = [int]$Battery.Reported
+    if ($p -gt 100) {
+        if ($null -ne $Battery.Cycles -and $Battery.Cycles -ge 100) {
+            return [pscustomobject]@{ Level = 'Info'; Text = (L 'reports {0} % after {1} charge cycles: its charge gauge needs a reset' $p $Battery.Cycles); GaugeOff = $true }
+        }
+        return [pscustomobject]@{ Level = 'Good'; Text = (L 'as good as new (it reports {0} %)' $p); GaugeOff = $false }
+    }
+    $lvl = if ($p -lt 60) { 'Bad' } elseif ($p -lt 80) { 'Warn' } else { 'Good' }
+    return [pscustomobject]@{ Level = $lvl; Text = (L '{0} % of its original capacity' $p); GaugeOff = $false }
 }
 
 function Test-IsLaptop {
@@ -2158,7 +2180,7 @@ function Get-WindowsUpdateStatus {
 
 function Format-DaysAgo($Date) {
     if (-not $Date) { return (L 'unknown') }
-    $days = [int][math]::Floor(((Get-Date) - [datetime]$Date).TotalDays)
+    $days = [int](((Get-Date).Date - ([datetime]$Date).Date).TotalDays)   # calendar days: yesterday 23:00 is yesterday
     if ($days -le 0) { return (L 'today') }
     if ($days -eq 1) { return (L 'yesterday') }
     return (L '{0} days ago' $days)
@@ -2194,8 +2216,8 @@ function Get-HealthItems {
         if (Test-IsLaptop) {
             $bh = Get-BatteryHealth
             if ($bh) {
-                $lvl = if ($bh.Percent -lt 60) { 'Bad' } elseif ($bh.Percent -lt 80) { 'Warn' } else { 'Good' }
-                $items.Add((New-HealthItem (N 'Battery') $lvl (L '{0} % of its original capacity' $bh.Percent) $(if ($lvl -ne 'Good') { '19' } else { '' })))
+                $v = Get-BatteryVerdict $bh
+                $items.Add((New-HealthItem (N 'Battery') $v.Level $v.Text $(if ($v.Level -ne 'Good') { '19' } else { '' })))
             }
         }
     } catch { }
@@ -2359,9 +2381,13 @@ function Show-HealthReport {
         Write-Kv 'Charge' "$($battery[0].EstimatedChargeRemaining) %"
         $bh = Get-BatteryHealth
         if ($bh) {
-            $health = $bh.Percent
-            Write-Kv 'Health' (L '{0} % of original capacity' $health) $(if ($health -lt 60) { 'Red' } elseif ($health -lt 80) { 'Yellow' } else { 'Green' })
+            $v = Get-BatteryVerdict $bh
+            Write-Kv 'Health' $v.Text $(switch ($v.Level) { 'Bad' { 'Red' } 'Warn' { 'Yellow' } 'Info' { 'Cyan' } default { 'Green' } })
             if ($null -ne $bh.Cycles) { Write-Kv 'Charge cycles' $bh.Cycles }
+            if ($v.GaugeOff) {
+                Write-Info 'A battery used this much cannot hold more than when it was new: its charge gauge is off, so its real wear is not known.'
+                Write-Info 'To reset the gauge: use the battery gauge reset of your PC maker''s app (Lenovo Vantage has one), or charge to 100 %, let the PC run on battery down to about 5 % in one go, then charge to 100 % again.'
+            }
         } else {
             Write-Kv 'Health' (L 'not reported by this battery') 'DarkGray'
         }
@@ -2954,7 +2980,7 @@ function Get-WingetQuietArgs {
     return @()
 }
 
-function Format-HexCode([int]$Code) { return ('0x{0:X8}' -f $Code) }
+function Format-HexCode([long]$Code) { return ('0x{0:X8}' -f ($Code -band 0xFFFFFFFFL)) }
 
 function ConvertFrom-WingetRow([string]$Row, [int[]]$Starts) {
     # One table row -> Name, Id, Version, Available (or $null when it is not a row).
@@ -3100,6 +3126,7 @@ function Get-UpdateMessage([string]$Hex) {
         '0x8A15010F' { return (N 'blocked by your organization') }
         '0x8A150114' { return (N 'its installer cannot update it - update it from the app itself') }
         '0x8A15002B' { return (N 'no update applies to this version') }
+        '0x8A15008E' { return (N 'the new version uses another installer than the installed one') }
         '0x80070422' { return (N 'Windows Update is turned off on this PC (its service is disabled)') }
         '0x80070005' { return (N 'access denied') }
         '0x8024402C' { return (N 'no connection to Windows Update') }
@@ -3119,29 +3146,49 @@ function Install-AppUpdate($Item) {
            '--accept-package-agreements', '--accept-source-agreements') + @(Get-WingetQuietArgs)
     $res = Invoke-Winget $a
     $hex = Format-HexCode $res.Code
-    $status = switch ($hex) {
-        '0x00000000' { 'Updated' }
-        '0x8A150109' { 'Restart' }
-        '0x8A15010B' { 'Restart' }
-        '0x8A15002B' { 'NotApplicable' }
-        '0x8A150101' { 'InUse' }
-        '0x8A150103' { 'InUse' }
-        '0x8A150111' { 'InUse' }
-        default      { 'Failed' }
-    }
-    return (New-UpdateResult $Item $status $hex)
+    return (New-UpdateResult $Item (Get-AppUpdateStatus $hex) $hex)
 }
 
-function New-UpdateResult($Item, [string]$Status, [string]$Hex = '') {
+function Get-AppUpdateStatus([string]$Hex) {
+    switch ($Hex) {
+        '0x00000000' { return 'Updated' }
+        '0x8A150109' { return 'Restart' }
+        '0x8A15010B' { return 'Restart' }
+        '0x8A15002B' { return 'NotApplicable' }
+        '0x8A150101' { return 'InUse' }
+        '0x8A150103' { return 'InUse' }
+        '0x8A150111' { return 'InUse' }
+        default      { return 'Failed' }
+    }
+}
+
+function Install-AppByReinstall($Item) {
+    # When the new version uses another installer than the installed one (0x8A15008E), winget cannot
+    # update it in place: the installed version is removed, then the new one is installed.
+    if ("$($Item.Id)" -notmatch '^[A-Za-z0-9][\w\.\-\+]{0,127}$') { return (New-UpdateResult $Item 'Failed' 'invalid Id') }
+    $q = @(Get-WingetQuietArgs)
+    $un = Invoke-Winget (@('uninstall', '--id', $Item.Id, '--exact', '--silent', '--accept-source-agreements') + $q)
+    if ($un.Code -ne 0) { return (New-UpdateResult $Item 'Failed' (Format-HexCode $un.Code) (L 'the installed version could not be removed')) }
+    $in = Invoke-Winget (@('install', '--id', $Item.Id, '--exact', '--source', 'winget', '--silent', '--accept-package-agreements', '--accept-source-agreements') + $q)
+    $hex = Format-HexCode $in.Code
+    $r = New-UpdateResult $Item (Get-AppUpdateStatus $hex) $hex
+    if ($r.Status -eq 'Failed') { $r.Detail = (L 'removed, but the new version did not install: install it from its website') }
+    return $r
+}
+
+function New-UpdateResult($Item, [string]$Status, [string]$Hex = '', [string]$Detail = '') {
     return [pscustomobject]@{
         Kind = $Item.Kind; Name = $Item.Name; Id = $Item.Id; From = $Item.From; To = $Item.To
-        Status = $Status; Code = $Hex
+        Status = $Status; Code = $Hex; Detail = $Detail
     }
 }
 
 function New-UpdateSession {
+    # One Windows Update session for the search and the installation that follows it.
+    if ($script:WuSession) { return $script:WuSession }
     $s = New-Object -ComObject 'Microsoft.Update.Session'
     $s.ClientApplicationID = 'YSO'
+    $script:WuSession = $s
     return $s
 }
 
@@ -3153,10 +3200,18 @@ function Get-ComErrorHex($ErrorRecord) {
     return (Format-HexCode $ex.HResult)
 }
 
+function Get-ErrorText($ErrorRecord) {
+    # The innermost message: PowerShell wraps the error Windows gave in its own.
+    $ex = $ErrorRecord.Exception
+    while ($ex.InnerException) { $ex = $ex.InnerException }
+    $m = ("$($ex.Message)" -replace '\s+', ' ').Trim()
+    return (Get-Truncated $m 160)
+}
+
 function Get-DriverUpdates {
     # Drivers Windows Update has for this PC. Optional = Microsoft says to install them only
     # when a device has a problem (Settings > Windows Update > Optional updates).
-    $r = [pscustomobject]@{ Ok = $false; Reason = ''; ReasonArg = ''; Drivers = @() }
+    $r = [pscustomobject]@{ Ok = $false; Reason = ''; ReasonArg = ''; Drivers = @(); Firmware = @() }
     $svc = Get-Service -Name 'wuauserv' -ErrorAction SilentlyContinue
     if ($svc -and "$($svc.StartType)" -eq 'Disabled') {
         $r.Reason = N 'Windows Update is turned off on this PC (its service is disabled)'
@@ -3173,8 +3228,14 @@ function Get-DriverUpdates {
         return $r
     }
     $list = @()
+    $firmware = @()
     for ($i = 0; $i -lt $found.Updates.Count; $i++) {
         $u = $found.Updates.Item($i)
+        # Firmware (BIOS, UEFI, the built-in software of a device) is never installed by YSO.
+        if ("$($u.DriverClass)" -match '(?i)^firmware$' -or "$($u.Title)" -match '(?i)\b(firmware|bios|uefi)\b') {
+            $firmware += [pscustomobject]@{ Name = "$($u.Title)"; Class = "$($u.DriverClass)" }
+            continue
+        }
         $date = ''
         try { if ($u.DriverVerDate) { $date = ([datetime]$u.DriverVerDate).ToString('yyyy-MM-dd') } } catch { }
         $list += [pscustomobject]@{
@@ -3184,37 +3245,73 @@ function Get-DriverUpdates {
         }
     }
     $r.Drivers = $list
+    $r.Firmware = $firmware
     $r.Ok = $true
     return $r
 }
 
 function Install-DriverUpdates([object[]]$Drivers) {
+    # One driver at a time: a driver that cannot be installed never stops the others, and each result
+    # says why. Every failure is written to errors.log with Windows' own message.
     $results = @()
-    if (@($Drivers).Count -eq 0) { return $results }
-    try {
-        $session = New-UpdateSession
-        $coll = New-UpdateCollection
-        foreach ($d in $Drivers) {
-            if (-not $d.Update.EulaAccepted) { $d.Update.AcceptEula() }
-            [void]$coll.Add($d.Update)
-        }
-        $dl = $session.CreateUpdateDownloader()
-        $dl.Updates = $coll
-        [void]$dl.Download()
-        $inst = $session.CreateUpdateInstaller()
-        $inst.Updates = $coll
-        try { $inst.ForceQuiet = $true } catch { }
-        $res = $inst.Install()
-        for ($i = 0; $i -lt @($Drivers).Count; $i++) {
-            $one = $res.GetUpdateResult($i)
-            $code = [int]$one.ResultCode   # 2 = succeeded, 3 = succeeded with errors, 4 = failed, 5 = aborted
-            $status = if ($code -eq 2 -or $code -eq 3) { if ($one.RebootRequired -or $res.RebootRequired) { 'Restart' } else { 'Updated' } } else { 'Failed' }
-            $results += (New-UpdateResult $Drivers[$i] $status (Format-HexCode ([int]$one.HResult)))
-        }
-    } catch {
-        $hex = Get-ComErrorHex $_
-        foreach ($d in $Drivers) { $results += (New-UpdateResult $d 'Failed' $hex) }
+    $all = @($Drivers)
+    if ($all.Count -eq 0) { return $results }
+    try { $session = New-UpdateSession }
+    catch {
+        Write-YsoError -Context 'driver updates: Windows Update' -ErrorRecord $_
+        foreach ($d in $all) { $results += (New-UpdateResult $d 'Failed' (Get-ComErrorHex $_) (Get-ErrorText $_)) }
+        return $results
     }
+    $n = 0
+    foreach ($d in $all) {
+        $n++
+        Write-YsoProgress -Activity (L 'Driver updates') -Status ('{0}/{1}  {2}' -f $n, $all.Count, $d.Name) -Percent (100 * ($n - 1) / $all.Count) -Force
+        $step = 'prepare'
+        try {
+            $u = $d.Update
+            if ($null -eq $u) { throw 'Windows Update no longer offers this update. Look for updates again.' }
+            $step = 'license'
+            if (-not $u.EulaAccepted) {
+                try { $u.AcceptEula() }
+                catch {
+                    # PowerShell may not see the method on some updates: the same call through IDispatch
+                    if ($_.Exception.InnerException) { throw }
+                    $base = $u.psobject.BaseObject
+                    [void]$base.GetType().InvokeMember('AcceptEula', [System.Reflection.BindingFlags]::InvokeMethod, $null, $base, $null)
+                }
+            }
+            $coll = New-UpdateCollection
+            [void]$coll.Add($u)
+            if (-not $u.IsDownloaded) {
+                $step = 'download'
+                $dl = $session.CreateUpdateDownloader()
+                $dl.Updates = $coll
+                $down = $dl.Download()
+                $dc = [int]$down.ResultCode   # 2 = succeeded, 3 = succeeded with errors, 4 = failed, 5 = aborted
+                if ($dc -ne 2 -and $dc -ne 3) {
+                    $results += (New-UpdateResult $d 'Failed' (Format-HexCode ($down.GetUpdateResult(0).HResult)) (L 'the download failed'))
+                    continue
+                }
+            }
+            $step = 'install'
+            $inst = $session.CreateUpdateInstaller()
+            $inst.Updates = $coll
+            try { $inst.ForceQuiet = $true } catch { }
+            $res = $inst.Install()
+            $one = $res.GetUpdateResult(0)
+            $code = [int]$one.ResultCode
+            if ($code -eq 2 -or $code -eq 3) {
+                $results += (New-UpdateResult $d $(if ($one.RebootRequired -or $res.RebootRequired) { 'Restart' } else { 'Updated' }) (Format-HexCode ($one.HResult)))
+            } else {
+                $results += (New-UpdateResult $d 'Failed' (Format-HexCode ($one.HResult)) (L 'Windows Update could not install it'))
+            }
+        } catch {
+            if (Test-StopError $_) { throw }
+            Write-YsoError -Context ('driver update (' + $step + '): ' + $d.Name) -ErrorRecord $_
+            $results += (New-UpdateResult $d 'Failed' (Get-ComErrorHex $_) ('{0}: {1}' -f $step, (Get-ErrorText $_)))
+        }
+    }
+    Write-YsoProgress -Activity (L 'Driver updates') -Completed
     return $results
 }
 
@@ -3340,7 +3437,7 @@ function Test-RecommendedUpdate($Item, [string]$Mode) {
     return $true
 }
 
-function Show-UpdateList([object[]]$Items, [object[]]$Others) {
+function Show-UpdateList([object[]]$Items, [object[]]$Others, [object[]]$Firmware = @()) {
     $apps = @($Items | Where-Object { $_.Kind -eq 'App' })
     $drivers = @($Items | Where-Object { $_.Kind -eq 'Driver' })
     $n = 0
@@ -3354,7 +3451,7 @@ function Show-UpdateList([object[]]$Items, [object[]]$Others) {
             if ($a.InUse) { $notes += (L 'open now') }
             Write-Host ('  {0,3}  ' -f $n) -NoNewline -ForegroundColor Green
             Write-Host ((Get-Truncated $a.Name 34).PadRight(35)) -NoNewline
-            Write-Host ('{0} -> {1}' -f (Get-Truncated $a.From 14), (Get-Truncated $a.To 14)).PadRight(32) -NoNewline -ForegroundColor Gray
+            Write-Host (('{0} -> {1}' -f (Get-Truncated $a.From 14), (Get-Truncated $a.To 14)).PadRight(32) + '  ') -NoNewline -ForegroundColor Gray
             Write-Host ($notes -join ', ') -ForegroundColor Yellow
         }
         if (@($apps | Where-Object { $_.Major -and -not $_.Excluded }).Count -gt 0) {
@@ -3381,13 +3478,21 @@ function Show-UpdateList([object[]]$Items, [object[]]$Others) {
         }
         Write-Info 'These apps update themselves or need their own updater (winget does not update them automatically).'
     }
+    if (@($Firmware).Count -gt 0) {
+        Write-Section 'FIRMWARE (NOT INSTALLED BY YSO)'
+        foreach ($fw in $Firmware) { Write-Host ('       ' + (Get-Truncated $fw.Name 70)) -ForegroundColor DarkGray }
+        Write-Info 'Firmware updates change the BIOS or the built-in software of a device. YSO leaves them to Windows Update (Settings > Windows Update) or to your PC maker''s app.'
+    }
 }
 
 function Read-UpdateSelection([int]$Count, [int[]]$Recommended) {
-    # A = the recommended ones; "1,3" or "2-4" = only those; Enter = nothing. Returns 1-based numbers.
-    $ans = Read-Choice 'A = install the recommended ones, numbers = only those (e.g. 1,3 or 2-4), Enter = nothing'
+    # A = the recommended ones; T = all; "1,3" or "2-4" = only those; Enter = nothing. Returns 1-based numbers.
+    if (@($Recommended).Count -gt 0) { Write-Option 'A' 'Install the recommended ones' }
+    Write-Option 'T' 'Install all of them (new major versions too)'
+    $ans = Read-Choice 'Or type numbers (e.g. 1,3 or 2-4), Enter = nothing'
     if (-not $ans) { return @() }
     if ($ans -eq 'A') { return @($Recommended) }
+    if ($ans -eq 'T') { return @(1..$Count) }
     $picked = @()
     foreach ($tok in @($ans -split '[,;\s]+' | Where-Object { $_ })) {
         if ($tok -match '^(\d+)-(\d+)$') {
@@ -3411,12 +3516,13 @@ function Write-UpdateResult($Result) {
         'Skipped'       { Write-Info ($Result.Name + ': ' + (L 'skipped - the app was open')) }
         default {
             $why = if ($msg) { L $msg } else { L 'error {0}' $Result.Code }
+            if ($Result.Detail -and -not $msg) { $why += ' (' + $Result.Detail + ')' }
             Write-Bad ($Result.Name + ': ' + $why)
         }
     }
 }
 
-function Install-ChosenUpdates([object[]]$Chosen) {
+function Install-ChosenUpdates([object[]]$Chosen, [string]$Mode = 'Manual') {
     $results = @()
     $apps = @($Chosen | Where-Object { $_.Kind -eq 'App' })
     $i = 0
@@ -3426,6 +3532,12 @@ function Install-ChosenUpdates([object[]]$Chosen) {
         Write-Host ('  [{0}/{1}] ' -f $i, $apps.Count) -NoNewline -ForegroundColor DarkGray
         Write-Host (L 'Updating {0} ({1} -> {2})...' $a.Name $a.From $a.To)
         $r = Install-AppUpdate $a
+        if ($r.Code -eq '0x8A15008E' -and $Mode -eq 'Manual' -and -not (Test-Unattended)) {
+            Write-Warn (L '{0}: the new version uses another installer than the installed one, so it cannot be updated in place.' $a.Name)
+            if (Confirm-Action (L 'Reinstall {0}? YSO removes the installed version, then installs {1}. Most apps keep your data, but some forget their settings.' $a.Name $a.To) $false) {
+                $r = Install-AppByReinstall $a
+            }
+        }
         Write-UpdateResult $r
         $results += $r
     }
@@ -3625,12 +3737,13 @@ function Invoke-UpdateRun {
     try {
         $found = Find-Updates $Mode
         $items = @($found.Items)
+        $firmware = @(if ($found.Drivers) { $found.Drivers.Firmware })
         $summary.Found = $items.Count
-        if ($items.Count -eq 0 -and @($found.Others).Count -eq 0) {
+        if ($items.Count -eq 0 -and @($found.Others).Count -eq 0 -and $firmware.Count -eq 0) {
             Write-Host ''
             Write-Ok 'Everything is up to date.'
         } else {
-            Show-UpdateList $items $found.Others
+            Show-UpdateList $items $found.Others $firmware
         }
         if ($Mode -eq 'Manual') {
             Write-Host ''
@@ -3681,7 +3794,7 @@ function Invoke-UpdateRun {
                 elseif (Confirm-Action 'Create a restore point before installing drivers? (recommended)' $true) { [void](New-YsoRestorePoint) }
             }
             Write-Info 'Installing - this can take a while. Your PC will not be restarted.'
-            $results = @(Install-ChosenUpdates $chosen)
+            $results = @(Install-ChosenUpdates $chosen $Mode)
         }
         $all = @($results) + @($skippedOpen)
         $summary.Installed = @($results | Where-Object { $_.Status -eq 'Updated' -or $_.Status -eq 'Restart' }).Count
@@ -4765,7 +4878,7 @@ function Invoke-SelfTest {
         if (-not (Test-IsLaptop)) { return (Result-Info (L 'no battery')) }
         $bh = Get-BatteryHealth
         if ($bh) {
-            $text = L 'health {0} %' $bh.Percent
+            $text = L 'health {0} %' $bh.Reported
             if ($null -ne $bh.Cycles) { $text += ', ' + (L '{0} charge cycles' $bh.Cycles) }
             return (Result-Ok $text)
         }
@@ -6832,7 +6945,7 @@ function Add-GuiDocMessage($m) {
             Add-GuiBlock (New-GuiText ([string]$m[1]) 12 'Text2' 'SemiBold' -Margin '0,16,0,6')
         }
         'kv' {
-            [void]$script:GuiDocText.AppendLine(('{0}: {1}' -f $m[1], $m[2]))
+            [void]$script:GuiDocText.AppendLine(('{0}: {1}' -f ([string]$m[1]).TrimEnd(':', ' '), $m[2]))
             $g = New-Object System.Windows.Controls.Grid
             $g.Margin = New-GuiThickness '0,2,0,2'
             $g.ColumnDefinitions.Add((New-GuiColumn '240')); $g.ColumnDefinitions.Add((New-GuiColumn '*'))
@@ -6891,7 +7004,7 @@ function Add-GuiDocMessage($m) {
             Add-GuiBlock $b
         }
         'health' {
-            [void]$script:GuiDocText.AppendLine(('{0}: {1}' -f $m[2], $m[3]))
+            [void]$script:GuiDocText.AppendLine(('{0}: {1}' -f ([string]$m[2]).TrimEnd(':', ' '), $m[3]))
             $look = @{ Good = @('Good', [string][char]0xE73E); Warn = @('Warn', [string][char]0xE7BA); Bad = @('Bad', [string][char]0xEA39); Info = @('Info', [string][char]0xE946) }
             $l = $look[[string]$m[1]]; if (-not $l) { $l = $look['Info'] }
             $g = New-Object System.Windows.Controls.Grid
@@ -7036,7 +7149,7 @@ function Set-GuiUpdateOffer($Release) {
     $script:GuiRelease = $Release
     $ui = $script:Ui
     if ($Release) {
-        $ui.UpdateText.Text = (L 'Update to YSO {0}' $Release.Version)
+        $ui.UpdateText.Text = $(if ($Release.PSObject.Properties['Build']) { L 'Install the fixes for YSO {0}' $Release.Version } else { L 'Update to YSO {0}' $Release.Version })
         $ui.UpdateBtn.ToolTip = (L 'A new version of YSO is published on GitHub.')
         $ui.UpdateBtn.Visibility = 'Visible'
     } else { $ui.UpdateBtn.Visibility = 'Collapsed' }
@@ -7048,7 +7161,7 @@ function Show-GuiUpdateDialog {
     if (Test-GuiBusy) { Show-GuiBusyMessage; return }
     $notes = $r.Notes
     if ($notes.Length -gt 700) { $notes = $notes.Substring(0, 700).TrimEnd() + ' ...' }
-    $parts = @((L 'Installed: {0}. New: {1}.' $script:Version $r.Version))
+    $parts = @($(if ($r.PSObject.Properties['Build']) { L 'A corrected build of YSO {0} is published (same version, with fixes).' $r.Version } else { L 'Installed: {0}. New: {1}.' $script:Version $r.Version }))
     if ($notes) { $parts += $notes }
     $parts += (L 'YSO downloads it from GitHub, checks its SHA-256 checksum, then replaces itself. Your settings and history stay.')
     Show-GuiDialog -Title (L 'YSO {0} is available' $r.Version) -Text ($parts -join "`n`n") -Yes (L 'Update now') -No (L 'Later') -OnYes { Start-GuiSelfUpdate }
@@ -7574,10 +7687,18 @@ function ConvertFrom-YsoRelease($Release) {
     }
 }
 
+function Get-YsoFileHash {
+    # SHA-256 of this YSO.ps1, to tell a corrected build of the same version from this one.
+    try { if ($script:SelfPath -and (Test-Path -LiteralPath $script:SelfPath)) { return (Get-FileHash -LiteralPath $script:SelfPath -Algorithm SHA256).Hash.ToLowerInvariant() } } catch { }
+    return ''
+}
+
 function Get-YsoUpdateOffer([switch]$Force) {
-    # The newer YSO to offer, or $null. Asks GitHub at most once an hour (the answer is kept meanwhile).
+    # The YSO to offer, or $null: a newer version, or a corrected build of this version (its file
+    # differs from this one). Asks GitHub at most once an hour; the answer is kept meanwhile.
     if (-not $script:Settings.CheckForUpdates -and -not $Force) { return $null }
     $release = $null
+    $sum = ''
     $fresh = $false
     if (-not $Force -and (Test-Path -LiteralPath $script:UpdateCheckPath)) {
         try {
@@ -7586,6 +7707,7 @@ function Get-YsoUpdateOffer([switch]$Force) {
             if (((Get-Date) - $when).TotalMinutes -lt 60 -and ((Get-Date) - $when).TotalMinutes -ge 0) {
                 $fresh = $true
                 if ($c.Release) { $release = ConvertFrom-YsoRelease $c.Release }
+                if ("$($c.Sum)" -match '^[0-9a-f]{64}$') { $sum = "$($c.Sum)" }
             }
         } catch { }
     }
@@ -7599,6 +7721,10 @@ function Get-YsoUpdateOffer([switch]$Force) {
             if ("$($_.Exception.Message)" -notmatch '404') { return $null }
         }
         $release = ConvertFrom-YsoRelease $raw
+        if ($release -and $release.Version -eq [version]$script:Version) {
+            # same version: the SHA-256 of the published file tells whether it is another build
+            try { $sum = [regex]::Match([System.Text.Encoding]::ASCII.GetString((Get-YsoWebBytes $release.SumUrl 4KB)), '\b[0-9a-fA-F]{64}\b').Value.ToLowerInvariant() } catch { $sum = '' }
+        }
         try {
             New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null
             $keep = $null
@@ -7606,11 +7732,19 @@ function Get-YsoUpdateOffer([switch]$Force) {
                 $keep = [ordered]@{ tag_name = $release.Tag; body = $release.Notes; html_url = $release.Page; draft = $false; prerelease = $false
                     assets = @([ordered]@{ name = 'YSO.ps1'; browser_download_url = $release.Url; size = 0 }, [ordered]@{ name = 'YSO.ps1.sha256'; browser_download_url = $release.SumUrl; size = 0 }) }
             }
-            [ordered]@{ Checked = (Get-Date).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture); Release = $keep } |
+            [ordered]@{ Checked = (Get-Date).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture); Release = $keep; Sum = $sum } |
                 ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:UpdateCheckPath -Encoding UTF8
         } catch { }
     }
-    if ($release -and $release.Version -gt [version]$script:Version) { return $release }
+    if (-not $release) { return $null }
+    if ($release.Version -gt [version]$script:Version) { return $release }
+    if ($release.Version -eq [version]$script:Version -and $sum) {
+        $own = Get-YsoFileHash
+        if ($own -and $own -ne $sum) {
+            $release | Add-Member -NotePropertyName Build -NotePropertyValue $true -Force
+            return $release
+        }
+    }
     return $null
 }
 
@@ -7694,7 +7828,6 @@ function Get-FrenchStrings {
 [number] open folder   [B] back   [F] biggest files   [E] show in Explorer   [Q] done ==> [numéro] ouvrir le dossier   [B] retour   [F] plus gros fichiers   [E] voir dans l'Explorateur   [Q] terminer
 [Y/n] ==> [O/n]
 [y/N] ==> [o/N]
-A = install the recommended ones, numbers = only those (e.g. 1,3 or 2-4), Enter = nothing ==> A = installer celles recommandées, numéros = seulement celles-là (ex. 1,3 ou 2-4), Entrée = rien
 a component it needs is missing ==> un composant nécessaire est absent
 a drive reports a failure - back up your files now ==> un disque signale une panne - sauvegardez vos fichiers maintenant
 a drive reports a warning ==> un disque signale un avertissement
@@ -7942,7 +8075,6 @@ winget failed ({0}) ==> échec de winget ({0})
 {0}  (includes holding the power button) ==> {0}  (y compris les appuis longs sur le bouton d'alimentation)
 {0} % of its original capacity ==> {0} % de sa capacité d'origine
 {0} ({1} days ago) ==> {0} (il y a {1} jours)
-{0} % of original capacity ==> {0} % de la capacité d'origine
 {0} ({1}): {2} found, {3} installed, {4} not installed ==> {0} ({1}) : {2} trouvée(s), {3} installée(s), {4} non installée(s)
 {0} characters ==> {0} caractères
 {0} could not be installed - see Updates (28). ==> {0} non installée(s) - voir Mises à jour (28).
@@ -8660,6 +8792,24 @@ YSO is busy ==> YSO est occupé
 YSO is installed: Start menu, Desktop, and Settings > Apps > Installed apps (to uninstall it). ==> YSO est installé : menu Démarrer, Bureau, et Paramètres > Applications > Applications installées (pour le désinstaller).
 YSO was uninstalled. ==> YSO a été désinstallé.
 Your answer is needed below. ==> Votre réponse est attendue ci-dessous.
+{0}: the new version uses another installer than the installed one, so it cannot be updated in place. ==> {0} : la nouvelle version utilise un autre installateur que la version installée, elle ne peut donc pas être mise à jour directement.
+A battery used this much cannot hold more than when it was new: its charge gauge is off, so its real wear is not known. ==> Une batterie aussi utilisée ne peut pas contenir plus que neuve : sa jauge de charge est faussée, son usure réelle n'est donc pas connue.
+A corrected build of YSO {0} is published (same version, with fixes). ==> Une version corrigée de YSO {0} est publiée (même version, avec des corrections).
+as good as new (it reports {0} %) ==> comme neuve (elle indique {0} %)
+FIRMWARE (NOT INSTALLED BY YSO) ==> MICROLOGICIELS (NON INSTALLÉS PAR YSO)
+Firmware updates change the BIOS or the built-in software of a device. YSO leaves them to Windows Update (Settings > Windows Update) or to your PC maker's app. ==> Les mises à jour de micrologiciel modifient le BIOS ou le logiciel intégré d'un appareil. YSO les laisse à Windows Update (Paramètres > Windows Update) ou à l'appli du fabricant de votre PC.
+Install all of them (new major versions too) ==> Tout installer (nouvelles versions majeures comprises)
+Install the fixes for YSO {0} ==> Installer les corrections de YSO {0}
+Install the recommended ones ==> Installer celles recommandées
+Or type numbers (e.g. 1,3 or 2-4), Enter = nothing ==> Ou tapez des numéros (ex. 1,3 ou 2-4), Entrée = rien
+Reinstall {0}? YSO removes the installed version, then installs {1}. Most apps keep your data, but some forget their settings. ==> Réinstaller {0} ? YSO désinstalle la version installée, puis installe la {1}. La plupart des applis gardent vos données, mais certaines oublient leurs réglages.
+removed, but the new version did not install: install it from its website ==> désinstallée, mais la nouvelle version ne s'est pas installée : installez-la depuis son site
+reports {0} % after {1} charge cycles: its charge gauge needs a reset ==> indique {0} % après {1} cycles de charge : sa jauge de charge doit être réinitialisée
+the download failed ==> le téléchargement a échoué
+the installed version could not be removed ==> la version installée n'a pas pu être désinstallée
+the new version uses another installer than the installed one ==> la nouvelle version utilise un autre installateur que la version installée
+To reset the gauge: use the battery gauge reset of your PC maker's app (Lenovo Vantage has one), or charge to 100 %, let the PC run on battery down to about 5 % in one go, then charge to 100 % again. ==> Pour réinitialiser la jauge : utilisez la réinitialisation de jauge de batterie de l'appli du fabricant (Lenovo Vantage en a une), ou chargez à 100 %, laissez le PC sur batterie jusqu'à environ 5 % d'une traite, puis rechargez à 100 %.
+Windows Update could not install it ==> Windows Update n'a pas pu l'installer
 A new version of YSO is published on GitHub. ==> Une nouvelle version de YSO est publiée sur GitHub.
 checked on GitHub when YSO opens ==> vérifiées sur GitHub à l'ouverture de YSO
 Check for new versions of YSO ==> Vérifier les nouvelles versions de YSO

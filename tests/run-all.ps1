@@ -54,6 +54,8 @@ foreach ($kind in 'missing', 'unused') {
     if ($m.Success -and $m.Groups[1].Value.Trim()) { $fail += "$kind translations: " + $m.Groups[1].Value.Trim() }
 }
 if ($out -notmatch 'placeholder mismatches: 0') { $fail += 'a translation has different {0} placeholders' }
+$m = [regex]::Match($out, '(?m)^duplicated: (.*)$')
+if ($m.Success -and $m.Groups[1].Value.Trim()) { $fail += 'translated twice: ' + $m.Groups[1].Value.Trim() }
 $count = [regex]::Match($out, 'strings in code: (\d+)').Groups[1].Value
 Add-Line 'French translation complete' $(if ($fail.Count) { 0 } else { 3 }) $fail "($count texts)"
 

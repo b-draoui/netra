@@ -79,6 +79,25 @@ Import-Settings
 Remove-Item -LiteralPath $script:SettingsPath; Import-Settings
 Check ($script:Settings.CheckForUpdates -eq $true) 'on by default'
 
+Write-Host "`n===== A CORRECTED BUILD OF THE SAME VERSION =====" -ForegroundColor White
+Remove-Item -LiteralPath $script:UpdateCheckPath -ErrorAction SilentlyContinue
+$script:SelfPath = "$Sandbox/self.ps1"; Set-Content -LiteralPath $script:SelfPath -Value 'this build'
+$own = (Get-FileHash -LiteralPath $script:SelfPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$script:Published = ('a' * 64)
+function Get-YsoWebBytes([string]$Url, [int]$MaxBytes = 5MB) {
+    $script:Calls++
+    if ($Url.EndsWith('.sha256')) { return , [System.Text.Encoding]::ASCII.GetBytes($script:Published + '  YSO.ps1') }
+    return , [System.Text.Encoding]::UTF8.GetBytes((New-Release -Tag 'v1.0' | ConvertTo-Json -Depth 5))
+}
+$o = Get-YsoUpdateOffer
+Check ($o -and $o.Version -eq [version]'1.0' -and $o.PSObject.Properties['Build']) 'same version, but the published file differs: its fixes are offered'
+$o = Get-YsoUpdateOffer
+Check ($o -and $o.PSObject.Properties['Build']) 'and kept for the hour like any answer'
+Remove-Item -LiteralPath $script:UpdateCheckPath
+$script:Published = $own
+Check ($null -eq (Get-YsoUpdateOffer)) 'same version and same file: nothing offered'
+Remove-Item -LiteralPath $script:UpdateCheckPath
+
 Write-Host "`n===== INSTALLING A NEW VERSION =====" -ForegroundColor White
 $target = "$Sandbox/ProgramFiles/YSO/YSO.ps1"
 New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null

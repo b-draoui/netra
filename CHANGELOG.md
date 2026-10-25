@@ -11,3 +11,14 @@ First public version.
 - **Installation in one line** (`install.ps1`): Program Files, Start menu, Desktop, and Settings > Apps > Installed apps with Uninstall, without "Windows protected your PC".
 - English and French. Requires Windows 10 version 1607 or later, or Windows 11 (Intel, AMD or ARM).
 - Tested on every change: about 600 automated checks on Linux, and the window, the self-test, the update check and the installation on Windows Server 2022, Windows Server 2025 and Windows 11.
+
+Fixes after the first tests on real PCs (same version, corrected build):
+
+- **Driver updates** are installed one at a time, so one that fails no longer stops the others, and each failure gives Windows' own reason. Before, one update could make all of them fail with error 0x80131501.
+- **Firmware updates** (BIOS, UEFI, built-in software of a device) are listed apart and never installed, as promised.
+- **An app whose new version uses another installer** (winget error 0x8A15008E): YSO explains it and offers to reinstall it (remove the old version, install the new one). Automatic updates never do this.
+- **Install all of them**: next to "the recommended ones", a choice to install every update found, new major versions included.
+- **Battery above 100 %**: the health shown is never above 100 %. After many charge cycles, YSO says the charge gauge needs a reset and how to do it, instead of showing it as healthy.
+- "Yesterday" means the calendar day: an update installed yesterday evening is no longer shown as today.
+- Copied text no longer shows "Drive C::"; the update list keeps a space between versions and notes.
+- Installed copies of 1.0 offer these fixes with their Update button.

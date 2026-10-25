@@ -76,6 +76,26 @@ $script:Lang = 'en'
 Check ($script:Checks[0].Status -eq 'OK' -and $script:Checks[0].Detail -eq 'santé 80 %') "self-test battery line: $($script:Checks[0].Status) $($script:Checks[0].Detail)"
 Remove-Item function:Get-CimInstance, function:powercfg.exe
 
+Write-Host "`n===== A BATTERY THAT REPORTS MORE THAN 100 % =====" -ForegroundColor White
+function Get-CimInstance { param($Namespace, $ClassName, $ErrorAction) throw 'no WMI here' }
+$script:BatteryXml = '<?xml version="1.0"?><BatteryReport xmlns="http://schemas.microsoft.com/battery/2012"><Batteries><Battery><DesignCapacity>45000</DesignCapacity><FullChargeCapacity>45900</FullChargeCapacity><CycleCount>648</CycleCount></Battery></Batteries></BatteryReport>'
+function powercfg.exe { $i = [array]::IndexOf($args, '/output'); Set-Content -LiteralPath $args[$i + 1] -Value $script:BatteryXml -Encoding UTF8 }
+$bh = Get-BatteryHealth
+Check ($bh.Reported -eq 102 -and $bh.Percent -eq 100 -and $bh.Cycles -eq 648) "what it reports is kept (102 %), the health used is never above 100 % ($($bh.Percent) %)"
+$v = Get-BatteryVerdict $bh
+Check ($v.Level -eq 'Info' -and $v.GaugeOff -and $v.Text -eq 'reports 102 % after 648 charge cycles: its charge gauge needs a reset') "after 648 cycles: not shown as healthy, the gauge needs a reset ($($v.Text))"
+$script:Lang = 'fr'
+Check ((Get-BatteryVerdict $bh).Text -eq 'indique 102 % après 648 cycles de charge : sa jauge de charge doit être réinitialisée') 'in French too'
+$script:Lang = 'en'
+$v = Get-BatteryVerdict ([pscustomobject]@{ Reported = 103; Percent = 100; Cycles = 12 })
+Check ($v.Level -eq 'Good' -and $v.Text -eq 'as good as new (it reports 103 %)' -and -not $v.GaugeOff) 'a new battery (12 cycles) slightly above its rated capacity: as good as new'
+Check ((Get-BatteryVerdict ([pscustomobject]@{ Reported = 59; Percent = 59; Cycles = 300 })).Level -eq 'Bad' -and (Get-BatteryVerdict ([pscustomobject]@{ Reported = 75; Percent = 75; Cycles = $null })).Level -eq 'Warn') 'worn batteries keep their red and orange'
+Remove-Item function:Get-CimInstance, function:powercfg.exe
+
+Write-Host "`n===== DAYS AGO (CALENDAR DAYS) =====" -ForegroundColor White
+Check ((Format-DaysAgo ((Get-Date).Date.AddDays(-1).AddHours(23))) -eq 'yesterday') 'installed yesterday at 23:00: yesterday, even less than 24 hours ago'
+Check ((Format-DaysAgo ((Get-Date).Date.AddMinutes(1))) -eq 'today' -and (Format-DaysAgo ((Get-Date).Date.AddDays(-3).AddHours(1))) -eq '3 days ago') 'today, and 3 days ago'
+
 Write-Host "`n===== WARM-UP PING IS NOT COUNTED =====" -ForegroundColor White
 $r = Measure-Ping '127.0.0.1' 3
 Check ($null -ne $r -and $r.Loss -ge 0 -and $r.Loss -le 100) "Measure-Ping still works (avg $($r.Avg) ms, loss $($r.Loss) %)"

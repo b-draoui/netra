@@ -64,6 +64,17 @@ jobs:
           if ($code -ne 0) { "::error::The update check ended with code $code - see errors.log below" }
           exit $code
 
+      - name: Install a real update through YSO (Windows Update)
+        if: always()
+        continue-on-error: true
+        shell: powershell
+        timeout-minutes: 25
+        run: |
+          # The machine is thrown away afterwards: a small real update (Microsoft Defender's definitions)
+          # is installed with YSO's own code, as the window does and as the console does.
+          Set-Service -Name wuauserv -StartupType Manual -ErrorAction SilentlyContinue
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\windows\real-update-install.ps1 -Title "Real update on ${{ matrix.os }}"
+
       - name: Self-test on real Windows (reads and measures only, cleans nothing)
         if: always()
         shell: powershell
@@ -204,8 +215,16 @@ jobs:
           version=$(grep -oP "^\\\$script:Version\s*=\s*'\K[0-9]+(\.[0-9]+){1,3}" YSO.ps1 | head -1)
           if [ -z "$version" ]; then echo "::error::No version found in YSO.ps1"; exit 1; fi
           tag="v$version"
-          if gh release view "$tag" > /dev/null 2>&1; then echo "YSO $version is already published."; exit 0; fi
           sha256sum YSO.ps1 > YSO.ps1.sha256
+          if gh release view "$tag" > /dev/null 2>&1; then
+            # Same version: published again only when YSO.ps1 changed (fixes before the next version).
+            # Installed copies of this version then offer "the fixes for YSO $version".
+            mkdir -p published && gh release download "$tag" -p YSO.ps1.sha256 -D published --clobber
+            if [ "$(cut -c1-64 published/YSO.ps1.sha256)" = "$(cut -c1-64 YSO.ps1.sha256)" ]; then echo "YSO $version is already published."; exit 0; fi
+            echo "YSO.ps1 changed since YSO $version was published: publishing the corrected build."
+            gh release delete "$tag" --yes --cleanup-tag
+            sleep 5
+          fi
           # the notes: the section of CHANGELOG.md for this version
           awk -v v="$version" '/^## /{p=($2==v); next} p' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "YSO $version" > notes.md

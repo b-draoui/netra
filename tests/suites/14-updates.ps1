@@ -181,7 +181,7 @@ $env:ProgramFiles = $savedPF
 Write-Host "`n===== DRIVERS FROM WINDOWS UPDATE (stand-in) =====" -ForegroundColor White
 function New-FakeUpdate([string]$Title, [string]$Class, [bool]$Optional, [bool]$Eula = $true) {
     $u = [pscustomobject]@{ Title = $Title; DriverClass = $Class; BrowseOnly = $Optional; DriverVerDate = [datetime]'2026-09-01'
-                            Identity = [pscustomobject]@{ UpdateID = [guid]::NewGuid().ToString() }; EulaAccepted = $Eula; Accepted = $false }
+                            Identity = [pscustomobject]@{ UpdateID = [guid]::NewGuid().ToString() }; EulaAccepted = $Eula; Accepted = $false; IsDownloaded = $false }
     $u | Add-Member -MemberType ScriptMethod -Name AcceptEula -Value { $this.Accepted = $true; $this.EulaAccepted = $true }
     return $u
 }
@@ -193,7 +193,8 @@ function New-FakeCollection([object[]]$Items) {
     $c | Add-Member -MemberType ScriptMethod -Name Add -Value { param($x) $this.List.Add($x) }
     return $c
 }
-$script:FakeUpdates = @((New-FakeUpdate 'Intel Corporation - Display - 31.0.101.5186' 'Display' $false), (New-FakeUpdate 'Realtek - Audio - 6.0.9600.1' 'MEDIA' $true $false))
+$script:FakeUpdates = @((New-FakeUpdate 'Intel Corporation - Display - 31.0.101.5186' 'Display' $false), (New-FakeUpdate 'Realtek - Audio - 6.0.9600.1' 'MEDIA' $true $false),
+                       (New-FakeUpdate 'Lenovo Ltd. - Firmware - 1.38.0.0' 'Firmware' $false))
 $script:SearchError = $null
 function New-UpdateSession {
     $s = [pscustomobject]@{}
@@ -202,13 +203,25 @@ function New-UpdateSession {
         $q | Add-Member -MemberType ScriptMethod -Name Search -Value { param($c) $script:Criteria = $c; if ($script:SearchError) { throw $script:SearchError }; [pscustomobject]@{ Updates = (New-FakeCollection $script:FakeUpdates) } }
         $q
     }
-    $s | Add-Member -MemberType ScriptMethod -Name CreateUpdateDownloader -Value { $d = [pscustomobject]@{ Updates = $null }; $d | Add-Member -MemberType ScriptMethod -Name Download -Value { $script:Downloaded = $this.Updates.Count; 2 }; $d }
+    $s | Add-Member -MemberType ScriptMethod -Name CreateUpdateDownloader -Value {
+        $d = [pscustomobject]@{ Updates = $null }
+        $d | Add-Member -MemberType ScriptMethod -Name Download -Value {
+            if ($script:DownloadError -and $this.Updates.Item(0).Title -like $script:DownloadError[0]) { throw $script:DownloadError[1] }
+            $script:Downloaded += $this.Updates.Count
+            $r = [pscustomobject]@{ ResultCode = 2 }
+            $r | Add-Member -MemberType ScriptMethod -Name GetUpdateResult -Value { param($n) [pscustomobject]@{ HResult = 0 } }
+            $r
+        }
+        $d
+    }
     $s | Add-Member -MemberType ScriptMethod -Name CreateUpdateInstaller -Value {
         $i = [pscustomobject]@{ Updates = $null; ForceQuiet = $false }
         $i | Add-Member -MemberType ScriptMethod -Name Install -Value {
-            $script:Installed = $this.Updates.Count
-            $r = [pscustomobject]@{ RebootRequired = $false }
-            $r | Add-Member -MemberType ScriptMethod -Name GetUpdateResult -Value { param($n) $script:InstallResults[$n] }
+            $script:Installed += $this.Updates.Count
+            $one = $script:InstallResults[$script:InstallCall]
+            $script:InstallCall++
+            $r = [pscustomobject]@{ RebootRequired = $false; One = $one }
+            $r | Add-Member -MemberType ScriptMethod -Name GetUpdateResult -Value { param($n) $this.One }
             $r
         }
         $i
@@ -220,6 +233,7 @@ function Get-Service { param($Name, $ErrorAction) [pscustomobject]@{ Status = 'S
 $script:WuStart = 'Manual'
 $d = Get-DriverUpdates
 Check ($d.Ok -and $d.Drivers.Count -eq 2) 'two drivers found'
+Check (@($d.Firmware).Count -eq 1 -and $d.Firmware[0].Name -match 'Firmware' -and @($d.Drivers | Where-Object { $_.Name -match 'Firmware' }).Count -eq 0) 'firmware (BIOS) updates are listed apart and never installed'
 Check ($script:Criteria -eq "IsInstalled=0 and Type='Driver' and IsHidden=0") 'only drivers that are not installed and not hidden'
 Check (-not $d.Drivers[0].Optional -and $d.Drivers[1].Optional -and $d.Drivers[0].Class -eq 'Display' -and $d.Drivers[0].To -eq '2026-09-01') 'recommended vs optional, class and date'
 $script:WuStart = 'Disabled'
@@ -237,13 +251,57 @@ $d = Get-DriverUpdates
 $okResult = [pscustomobject]@{ ResultCode = 2; HResult = 0; RebootRequired = $false }
 $rebootResult = [pscustomobject]@{ ResultCode = 2; HResult = 0; RebootRequired = $true }
 $script:InstallResults = @($okResult, $rebootResult)
+$script:Downloaded = 0; $script:Installed = 0; $script:InstallCall = 0
 $res = @(Install-DriverUpdates $d.Drivers)
 Check ($res.Count -eq 2 -and $res[0].Status -eq 'Updated' -and $res[1].Status -eq 'Restart') 'installed; the one that needs a restart says so'
 Check ($script:Downloaded -eq 2 -and $script:Installed -eq 2) 'both were downloaded, then installed'
 Check ($d.Drivers[1].Update.Accepted -and -not $d.Drivers[0].Update.Accepted) 'the licence is accepted only where Windows Update asks for it'
 $script:InstallResults = @([pscustomobject]@{ ResultCode = 4; HResult = -2145124330; RebootRequired = $false }, $okResult)   # 0x80240016
+$script:InstallCall = 0
 $res = @(Install-DriverUpdates $d.Drivers)
 Check ($res[0].Status -eq 'Failed' -and $res[0].Code -eq '0x80240016' -and $res[1].Status -eq 'Updated') 'a failed driver keeps its error code, the other one still installs'
+$script:DownloadError = @('Intel*', (New-Object System.Runtime.InteropServices.COMException('denied', -2145124284)))   # 0x80240044
+$script:InstallResults = @($okResult); $script:InstallCall = 0
+$res = @(Install-DriverUpdates $d.Drivers)
+Check ($res[0].Status -eq 'Failed' -and $res[0].Code -eq '0x80240044' -and $res[0].Detail -match '^download: ' -and $res[1].Status -eq 'Updated') "an error while downloading one driver: its real code and message, and the next one still installs ($($res[0].Code) $($res[0].Detail))"
+$script:DownloadError = $null
+$gone = [pscustomobject]@{ Kind = 'Driver'; Name = 'Gone driver'; Id = 'x'; From = ''; To = ''; Update = $null }
+$res = @(Install-DriverUpdates @($gone))
+Check ($res[0].Status -eq 'Failed' -and $res[0].Detail -match 'no longer offers') 'an update Windows Update no longer has: said in words, not a bare code'
+$out = (Write-UpdateResult $res[0] 6>&1 | Out-String)
+Check ($out -match 'Gone driver: error 0x[0-9A-F]{8} \(prepare: ') "the reason is shown next to the code: $($out.Trim())"
+Check ((Format-HexCode -2145124284) -eq '0x80240044' -and (Format-HexCode 2149843012) -eq '0x80240044' -and (Format-HexCode 0) -eq '0x00000000') 'error codes read the same whether Windows gives them signed or not'
+
+Write-Host "`n===== AN APP WHOSE NEW VERSION USES ANOTHER INSTALLER =====" -ForegroundColor White
+$script:Winget = New-Object System.Collections.Generic.List[string]
+function Invoke-Winget([string[]]$Arguments) {
+    $script:Winget.Add($Arguments[0])
+    switch ($Arguments[0]) {
+        'upgrade'   { return [pscustomobject]@{ Code = -1978335090; Lines = @() } }   # 0x8A15008E
+        'uninstall' { return [pscustomobject]@{ Code = 0; Lines = @() } }
+        'install'   { return [pscustomobject]@{ Code = 0; Lines = @() } }
+    }
+}
+function Get-WingetQuietArgs { @() }
+$pp = [pscustomobject]@{ Kind = 'App'; Name = 'Proton Pass'; Id = 'Proton.ProtonPass'; From = '1.37.0'; To = '1.42.0'; InUse = $false }
+$script:Asked = @()
+function Confirm-Action { param($Question, $Default) $script:Asked += $Question; $true }
+$res = @(Install-ChosenUpdates @($pp) 'Manual' 6>$null)
+Check ($script:Asked.Count -eq 1 -and $script:Asked[0] -match '^Reinstall Proton Pass\?' -and ($script:Winget -join ',') -eq 'upgrade,uninstall,install' -and $res[0].Status -eq 'Updated') "0x8A15008E: YSO offers to reinstall it, then removes the old version and installs the new one ($($script:Winget -join ', '))"
+$script:Winget.Clear(); $script:Asked = @()
+function Confirm-Action { param($Question, $Default) $script:Asked += $Question; $false }
+$res = @(Install-ChosenUpdates @($pp) 'Manual' 6>$null)
+Check (($script:Winget -join ',') -eq 'upgrade' -and $res[0].Status -eq 'Failed' -and (Get-UpdateMessage $res[0].Code) -match 'another installer') 'answering No changes nothing, and the reason is said in words'
+$script:Winget.Clear(); $script:Asked = @()
+$res = @(Install-ChosenUpdates @($pp) 'Auto' 6>$null)
+Check ($script:Asked.Count -eq 0 -and ($script:Winget -join ',') -eq 'upgrade') 'automatic updates never uninstall anything'
+Remove-Item function:Invoke-Winget, function:Get-WingetQuietArgs, function:Confirm-Action
+function Read-Host { param($Prompt) $script:Typed }
+$script:Typed = 'T'
+Check (((Read-UpdateSelection 5 @(2, 4) 6>$null) -join ',') -eq '1,2,3,4,5') 'T installs all of them'
+$script:Typed = 'A'
+Check (((Read-UpdateSelection 5 @(2, 4) 6>$null) -join ',') -eq '2,4') 'A installs the recommended ones'
+Remove-Item function:Read-Host
 
 Write-Host "`n===== AUTOMATIC RUN =====" -ForegroundColor White
 $script:Calls = New-Object System.Collections.Generic.List[string]
