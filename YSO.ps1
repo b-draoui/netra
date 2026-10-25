@@ -3192,7 +3192,10 @@ function New-UpdateSession {
     return $s
 }
 
-function New-UpdateCollection { return (New-Object -ComObject 'Microsoft.Update.UpdateColl') }
+function New-UpdateCollection {
+    # The comma keeps the empty list as it is: without it, PowerShell unrolls it and returns nothing.
+    return , (New-Object -ComObject 'Microsoft.Update.UpdateColl')
+}
 
 function Get-ComErrorHex($ErrorRecord) {
     $ex = $ErrorRecord.Exception

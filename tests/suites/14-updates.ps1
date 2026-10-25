@@ -228,7 +228,14 @@ function New-UpdateSession {
     }
     return $s
 }
-function New-UpdateCollection { return (New-FakeCollection @()) }
+# YSO's own New-UpdateCollection, with a list that PowerShell can unroll like the real one (COM)
+Invoke-Expression ($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'New-UpdateCollection' }, $false)[0].Extent.Text)
+& {
+    function New-Object { param([string]$ComObject) return , (Microsoft.PowerShell.Utility\New-Object -TypeName System.Collections.ArrayList) }
+    $c = New-UpdateCollection
+    Check ($null -ne $c -and $c.Count -eq 0) 'an empty update list stays a list (PowerShell must not unroll it into nothing)'
+}
+function New-UpdateCollection { return , (New-FakeCollection @()) }
 function Get-Service { param($Name, $ErrorAction) [pscustomobject]@{ Status = 'Stopped'; StartType = $script:WuStart } }
 $script:WuStart = 'Manual'
 $d = Get-DriverUpdates

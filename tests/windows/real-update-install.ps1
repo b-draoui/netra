@@ -38,12 +38,12 @@ $rs = [runspacefactory]::CreateRunspace(); $rs.ApartmentState = 'STA'; $rs.Threa
 $ps = [powershell]::Create(); $ps.Runspace = $rs
 [void]$ps.AddScript($job.ToString()).AddArgument($yso).AddArgument($ids)
 $out = @($ps.Invoke()) + @($ps.Streams.Error | ForEach-Object { "ERROR: $_" })
-Note 'notice' ("like the window (STA runspace): " + ($out -join "`n"))
+Note $(if (($out -join ' ') -match ': Failed ') { 'error' } else { 'notice' }) ("like the window (STA runspace): " + ($out -join "`n"))
 $ps.Dispose(); $rs.Dispose()
 # 2. in this PowerShell, like the console and the scheduled task
 if ($pick.Count -gt 1) {
     $ids = @($pick[1].Id)
     $out = @(& $job $yso $ids 2>&1 | ForEach-Object { "$_" })
-    Note 'notice' ("in the console: " + ($out -join "`n"))
+    Note $(if (($out -join ' ') -match ': Failed ') { 'error' } else { 'notice' }) ("in the console: " + ($out -join "`n"))
 }
 exit 0
