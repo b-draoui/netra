@@ -1,0 +1,213 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Read-only by default. Only the two jobs that publish something get write access to the repository.
+# Actions are pinned to a commit (the tag in the comment); Dependabot proposes their updates.
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: All test suites (PowerShell 7)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      - name: Run every test
+        shell: pwsh
+        run: ./tests/run-all.ps1
+
+  real-windows:
+    name: Real Windows - ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+
+      - name: Syntax check in Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\YSO.ps1", [ref]$null, [ref]$errors)
+          if ($errors) {
+            $errors | ForEach-Object { "::error file=YSO.ps1,line=$($_.Extent.StartLineNumber)::$($_.Message)" }
+            exit 1
+          }
+          "Windows PowerShell $($PSVersionTable.PSVersion) on $([Environment]::OSVersion.VersionString): no syntax errors"
+
+      - name: Update check on real Windows (lists app and driver updates, installs nothing)
+        shell: powershell
+        timeout-minutes: 20
+        run: |
+          # GitHub's Windows images turn Windows Update off. Turn it back on for this check only (the
+          # machine is thrown away afterwards), so the driver search runs against the real service.
+          Set-Service -Name wuauserv -StartupType Manual -ErrorAction SilentlyContinue
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\YSO.ps1 -AutoUpdate -DryRun
+          $code = $LASTEXITCODE
+          $report = Get-ChildItem "$env:ProgramData\YSO\Reports\updates_*.txt" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
+          if (-not $report) { "::error::No update report was written"; exit 1 }
+          # What YSO found (and how it read winget's output) is shown on the run page.
+          $parts = (Get-Content -LiteralPath $report.FullName -Raw -Encoding UTF8) -split '(?=WINGET OUTPUT)'
+          $n = 0
+          foreach ($part in $parts) {
+            $n++
+            $t = $part.Trim()
+            if ($t.Length -gt 3800) { $t = $t.Substring(0, 3800) + ' [...]' }
+            "::notice title=Update check on ${{ matrix.os }} ($n/$($parts.Count))::" + $t.Replace('%', '%25').Replace("`r", '').Replace("`n", '%0A')
+          }
+          if ($code -ne 0) { "::error::The update check ended with code $code - see errors.log below" }
+          exit $code
+
+      - name: Self-test on real Windows (reads and measures only, cleans nothing)
+        if: always()
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\YSO.ps1 -SelfTest
+          $code = $LASTEXITCODE
+          if ($code -eq 3) { "::error::YSO stopped on purpose (not running as administrator, or PowerShell is restricted)"; exit 1 }
+          # Every BROKEN / MISSING check and logged error is shown on the run page; the full report goes in the summary.
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\tools\publish-selftest.ps1 -Title "Self-test on ${{ matrix.os }}"
+          if ($code -ne 0) { "::error::$code self-test check(s) are BROKEN on this Windows" }
+          exit $code
+
+      - name: Window on real Windows (draws every page into pictures, English and French)
+        if: always()
+        shell: powershell
+        timeout-minutes: 30
+        run: |
+          $out = "$env:RUNNER_TEMP\screens\${{ matrix.os }}"
+          $settings = "$env:ProgramData\YSO\settings.json"
+          $errorsBefore = 0
+          if (Test-Path "$env:ProgramData\YSO\errors.log") { $errorsBefore = @(Get-Content "$env:ProgramData\YSO\errors.log" | Where-Object { $_ -like '==== *' }).Count }
+          $failed = @()
+          foreach ($lang in 'en', 'fr') {
+            New-Item -ItemType Directory -Force (Split-Path $settings) | Out-Null
+            $j = if (Test-Path $settings) { Get-Content $settings -Raw | ConvertFrom-Json } else { New-Object psobject }
+            $j | Add-Member -NotePropertyName Language -NotePropertyValue $lang -Force
+            $j | ConvertTo-Json -Depth 6 | Set-Content $settings -Encoding UTF8
+            # French: also the number formats of a French Windows (comma for decimals), like most French PCs
+            Set-Culture $(if ($lang -eq 'fr') { 'fr-FR' } else { 'en-US' })
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\YSO.ps1 -Snapshot "$out\$lang"
+            $code = $LASTEXITCODE
+            $culture = powershell.exe -NoProfile -Command '(Get-Culture).Name'
+            $pics = @(Get-ChildItem "$out\$lang" -Filter *.png -ErrorAction SilentlyContinue)
+            "::notice title=Window on ${{ matrix.os }} ($lang - formats $culture)::exit code $code, $($pics.Count) pictures in $([int]$clock.Elapsed.TotalSeconds) s: $(($pics | ForEach-Object { '{0} ({1:N0} KB)' -f $_.BaseName, ($_.Length / 1KB) }) -join ', ')"
+            if ($code -ne 0 -or $pics.Count -lt 8) { $failed += $lang }
+          }
+          Set-Culture en-US
+          $j.Language = 'en'; $j | ConvertTo-Json -Depth 6 | Set-Content $settings -Encoding UTF8
+          # what went wrong in the window is in errors.log: shown here
+          if (Test-Path "$env:ProgramData\YSO\errors.log") {
+            $blocks = ((Get-Content "$env:ProgramData\YSO\errors.log" -Raw) -split '(?m)^(?===== )') | Where-Object { $_.Trim() } | Select-Object -Skip $errorsBefore
+            foreach ($b in $blocks) { "::error title=errors.log (window)::" + ((@($b.Trim() -split "`r?`n") | Select-Object -First 9) -join '%0A') }
+          }
+          if ($failed) { "::error::The window could not draw every page ($($failed -join ', '))"; exit 1 }
+
+      - name: Install and uninstall like a user (install.ps1 from this commit)
+        if: always()
+        shell: powershell
+        timeout-minutes: 10
+        run: |
+          $env:YSO_REF = '${{ github.sha }}'
+          $env:YSO_UNATTENDED = '1'
+          Get-Content -LiteralPath .\install.ps1 -Raw | Invoke-Expression
+          $fail = @()
+          $dir = "$env:ProgramFiles\YSO"
+          $copy = "$dir\YSO.ps1"
+          if (-not (Test-Path $copy)) { $fail += 'YSO.ps1 is not in Program Files' }
+          elseif (Get-Item -LiteralPath $copy -Stream Zone.Identifier -ErrorAction SilentlyContinue) { $fail += 'the installed file is marked as downloaded from the Internet (Windows would warn)' }
+          if (-not (Test-Path "$dir\YSO.ico") -or (Get-Item "$dir\YSO.ico").Length -lt 2000) { $fail += 'no icon' }
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\YSO'
+          $k = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+          if (-not $k -or $k.DisplayName -ne 'YSO - Your System Optimizer' -or $k.UninstallString -notmatch '-Uninstall$') { $fail += 'not listed in Installed apps' }
+          $sh = New-Object -ComObject WScript.Shell
+          foreach ($lnk in "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\YSO.lnk", "$env:PUBLIC\Desktop\YSO.lnk") {
+            if (-not (Test-Path $lnk)) { $fail += "missing shortcut $lnk"; continue }
+            $l = $sh.CreateShortcut($lnk)
+            "::notice title=Shortcut on ${{ matrix.os }}::$($l.TargetPath) $($l.Arguments) | icon $($l.IconLocation)"
+          }
+          # Uninstall the way Settings > Apps does it
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File $copy -Uninstall
+          if (Test-Path $dir) { $fail += 'Program Files\YSO is still there after Uninstall' }
+          if (Test-Path $key) { $fail += 'still listed in Installed apps after Uninstall' }
+          if (Test-Path "$env:PUBLIC\Desktop\YSO.lnk") { $fail += 'Desktop shortcut still there after Uninstall' }
+          if (-not (Test-Path "$env:ProgramData\YSO")) { $fail += 'the history and settings were removed although the default is to keep them' }
+          foreach ($f in $fail) { "::error title=Install on ${{ matrix.os }}::$f" }
+          if ($fail) { exit 1 }
+          "::notice title=Install on ${{ matrix.os }}::install.ps1 installed YSO (Program Files, Start menu, Desktop, Installed apps, no Internet mark), and Uninstall removed it"
+
+      - name: Keep the pictures of the window
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        with:
+          name: window-${{ matrix.os }}
+          path: ${{ runner.temp }}/screens
+          if-no-files-found: warn
+
+      - name: Keep the self-test report and logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        with:
+          name: selftest-${{ matrix.os }}
+          path: |
+            C:\ProgramData\YSO\Reports\*.txt
+            C:\ProgramData\YSO\errors.log
+            C:\ProgramData\YSO\Logs\*.log
+          if-no-files-found: warn
+
+  pictures:
+    # Work branches only: the pictures of every page, on branch ci-pictures, to look at them without
+    # downloading artifacts. Never on main.
+    name: Window pictures (work branches)
+    needs: real-windows
+    if: always() && github.event_name == 'push' && github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131   # v7.0.0
+        with:
+          pattern: window-*
+          path: pictures
+          merge-multiple: true
+      - name: Publish them on branch ci-pictures
+        run: |
+          cd pictures
+          git init -q
+          git checkout -q -b pictures
+          git add -A
+          git -c user.name="github-actions" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -q -m "Window pictures for $GITHUB_SHA"
+          git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:refs/heads/ci-pictures
+
+  release:
+    # A new version of YSO is published when the version in YSO.ps1 changes on main and every test
+    # passed. Installed copies of YSO then show their Update button.
+    name: Publish the release (new version on main)
+    needs: [unit-tests, real-windows]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      - name: Publish YSO if its version is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(grep -oP "^\\\$script:Version\s*=\s*'\K[0-9]+(\.[0-9]+){1,3}" YSO.ps1 | head -1)
+          if [ -z "$version" ]; then echo "::error::No version found in YSO.ps1"; exit 1; fi
+          tag="v$version"
+          if gh release view "$tag" > /dev/null 2>&1; then echo "YSO $version is already published."; exit 0; fi
+          sha256sum YSO.ps1 > YSO.ps1.sha256
+          # the notes: the section of CHANGELOG.md for this version
+          awk -v v="$version" '/^## /{p=($2==v); next} p' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "YSO $version" > notes.md
+          gh release create "$tag" YSO.ps1 YSO.ps1.sha256 install.ps1 --title "YSO $version" --notes-file notes.md --target "$GITHUB_SHA"
+          echo "::notice title=Release::YSO $version published ($(cut -c1-16 YSO.ps1.sha256)...)"

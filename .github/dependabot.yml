@@ -1,0 +1,7 @@
+# Proposes updates of the GitHub Actions used by the tests (they are pinned to a commit).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

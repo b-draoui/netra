@@ -1,0 +1,7 @@
+* text=auto
+
+# YSO itself is stored byte for byte (UTF-8 with BOM, Windows line endings):
+# Windows PowerShell 5.1 needs the BOM for accented text, and batch files need CRLF.
+# (These lines must stay after "* text=auto": the last matching rule wins.)
+YSO.ps1 -text
+YSO.bat -text
