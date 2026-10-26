@@ -1190,15 +1190,48 @@ function Clear-SystemJunk {
     Invoke-Purge -Category 'System junk' -Targets $targets
 }
 
+function Get-DownloadedUpdates {
+    # Updates Windows Update has downloaded but not installed yet (from its last check: no internet
+    # needed). Their files are in the download cache: deleting them only makes Windows download them again.
+    try {
+        $searcher = (New-UpdateSession).CreateUpdateSearcher()
+        $searcher.Online = $false
+        $found = $searcher.Search("IsInstalled=0 and IsHidden=0")
+        $titles = @()
+        for ($i = 0; $i -lt $found.Updates.Count; $i++) {
+            $u = $found.Updates.Item($i)
+            if ($u.IsDownloaded) { $titles += "$($u.Title)" }
+        }
+        return $titles
+    } catch { return @() }
+}
+
 function Clear-UpdateCache {
     Write-Step 'Windows Update download cache + Delivery Optimization cache'
     $download = "$(Esc $env:WINDIR)\SoftwareDistribution\Download"
-    if ($script:DryRun) { Invoke-Purge -Category 'Windows Update cache' -Targets @(@{ Path = $download }); return }
-    if (Test-PendingReboot) {
+    $restart = [bool](Test-PendingReboot)
+    $installing = [bool](Get-Process -Name 'TiWorker' -ErrorAction SilentlyContinue)
+    $waiting = @()
+    if (-not $restart -and -not $installing) { $waiting = @(Get-DownloadedUpdates) }
+    if ($waiting.Count -gt 0) {
+        $name = Get-Truncated $waiting[0] 70
+        if ($waiting.Count -gt 1) { $name += ' ' + (L '(and {0} more)' ($waiting.Count - 1)) }
+        $waitText = L 'Windows Update has downloaded updates it has not installed yet ({0}): its download cache is kept, or Windows would download them again. Install them (Settings > Windows Update), then clean again.' $name
+    }
+    if ($script:DryRun) {
+        # Analyze shows what the cleaning would really remove.
+        if ($restart) { Write-Info 'Updates are waiting for a restart: the Windows Update download cache would be kept.' }
+        elseif ($waiting.Count -gt 0) { Write-Info $waitText }
+        else { Invoke-Purge -Category 'Windows Update cache' -Targets @(@{ Path = $download }) }
+        return
+    }
+    if ($restart) {
         # Downloads of updates waiting for the restart must stay; Delivery Optimization below still runs.
         Write-Warn 'Updates are waiting for a restart: the Windows Update download cache is kept. Restart, then run this again.'
-    } elseif (Get-Process -Name 'TiWorker' -ErrorAction SilentlyContinue) {
+    } elseif ($installing) {
         Write-Warn 'Windows Update is installing something right now: its download cache is kept. Try again later.'
+    } elseif ($waiting.Count -gt 0) {
+        Write-Warn $waitText
     } else {
         $wasRunning = @(Get-Service -Name 'wuauserv', 'bits' -ErrorAction SilentlyContinue |
             Where-Object { $_.Status -eq 'Running' } | ForEach-Object { $_.Name })
@@ -1383,12 +1416,30 @@ function Get-AppNameFromPath([string]$Dir, [string]$Base) {
             'MicrosoftWindows.Client.CBS' = (N 'Windows search and Start'); 'MicrosoftWindows.Client.WebExperience' = (N 'Windows widgets')
             '5319275A.WhatsAppDesktop' = 'WhatsApp'; 'Microsoft.OutlookForWindows' = 'Outlook'; 'Microsoft.Copilot' = 'Copilot'
             'Microsoft.MicrosoftOfficeHub' = 'Microsoft 365'; 'Microsoft.BingSearch' = 'Bing'; 'Microsoft.Windows.DevHome' = 'Dev Home'
+            'windows.immersivecontrolpanel' = (N 'Windows Settings'); 'Microsoft.WindowsStore' = 'Microsoft Store'
+            'Microsoft.Windows.ShellExperienceHost' = (N 'Windows taskbar and notifications'); 'MicrosoftTeams' = 'Teams'; 'MSTeams' = 'Teams'
+            'Microsoft.MicrosoftSolitaireCollection' = 'Solitaire'; 'Microsoft.SkypeApp' = 'Skype'; 'E046963F.LenovoCompanion' = 'Lenovo Vantage'
+            'Microsoft.GetHelp' = (N 'Windows Get Help'); 'Clipchamp.Clipchamp' = 'Clipchamp'; 'Microsoft.Windows.Photos' = (N 'Photos')
         }
         if ($friendly.ContainsKey($pkg)) { return (L $friendly[$pkg]) }
-        return ($pkg -split '\.')[-1]
+        return (Get-ReadableAppName (($pkg -split '\.')[-1]))
     }
-    if (@('Microsoft', 'Google', 'Programs') -contains $segs[0] -and $segs.Count -gt 1) { return $segs[1] }
-    return $segs[0]
+    if (@('Microsoft', 'Google', 'Programs') -contains $segs[0] -and $segs.Count -gt 1) {
+        # Microsoft\Windows\<part>: the part says more than "Windows"
+        if ($segs[0] -eq 'Microsoft' -and $segs[1] -eq 'Windows' -and $segs.Count -gt 2) { return ('Windows ' + (Get-ReadableAppName $segs[2])) }
+        return (Get-ReadableAppName $segs[1])
+    }
+    return (Get-ReadableAppName $segs[0])
+}
+
+function Get-ReadableAppName([string]$Name) {
+    # The folder name an app gives itself, made readable: "ollama app.exe" -> "Ollama", "Olk" -> "Outlook".
+    $n = ($Name -replace '(?i)\.exe(\.WebView2)?$', '' -replace '(?i)\.WebView2$', '').Trim()
+    $known = @{ 'Olk' = 'Outlook'; 'ollama app' = 'Ollama'; 'WindowsStore' = 'Microsoft Store'; 'MicrosoftTeams' = 'Teams'
+                'immersivecontrolpanel' = (N 'Windows Settings'); 'ShellExperienceHost' = (N 'Windows taskbar and notifications') }
+    foreach ($k in $known.Keys) { if ($n -ieq $k) { return (L $known[$k]) } }
+    if ($n -cmatch '^[a-z]' -and $n -notmatch '[A-Z]') { $n = $n.Substring(0, 1).ToUpperInvariant() + $n.Substring(1) }   # "ollama" -> "Ollama"
+    return $n
 }
 
 function Get-DetectedAppCacheTargets {
@@ -8795,6 +8846,13 @@ YSO is busy ==> YSO est occupé
 YSO is installed: Start menu, Desktop, and Settings > Apps > Installed apps (to uninstall it). ==> YSO est installé : menu Démarrer, Bureau, et Paramètres > Applications > Applications installées (pour le désinstaller).
 YSO was uninstalled. ==> YSO a été désinstallé.
 Your answer is needed below. ==> Votre réponse est attendue ci-dessous.
+(and {0} more) ==> (et {0} autre(s))
+Windows Update has downloaded updates it has not installed yet ({0}): its download cache is kept, or Windows would download them again. Install them (Settings > Windows Update), then clean again. ==> Windows Update a téléchargé des mises à jour qu'il n'a pas encore installées ({0}) : son cache de téléchargement est gardé, sinon Windows les retéléchargerait. Installez-les (Paramètres > Windows Update), puis nettoyez à nouveau.
+Updates are waiting for a restart: the Windows Update download cache would be kept. ==> Des mises à jour attendent un redémarrage : le cache de téléchargement de Windows Update serait gardé.
+Windows Settings ==> Paramètres Windows
+Windows taskbar and notifications ==> Barre des tâches et notifications de Windows
+Windows Get Help ==> Obtenir de l'aide (Windows)
+Photos ==> Photos
 {0}: the new version uses another installer than the installed one, so it cannot be updated in place. ==> {0} : la nouvelle version utilise un autre installateur que la version installée, elle ne peut donc pas être mise à jour directement.
 A battery used this much cannot hold more than when it was new: its charge gauge is off, so its real wear is not known. ==> Une batterie aussi utilisée ne peut pas contenir plus que neuve : sa jauge de charge est faussée, son usure réelle n'est donc pas connue.
 A corrected build of YSO {0} is published (same version, with fixes). ==> Une version corrigée de YSO {0} est publiée (même version, avec des corrections).

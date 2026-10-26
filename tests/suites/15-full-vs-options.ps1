@@ -150,6 +150,24 @@ $stop = Run-Scenario { Invoke-FullMaintenance }
 Check ($stop.Questions.Count -eq 1 -and $stop.Total -eq 0) 'pressing Enter there stops F, so you can restart first'
 $script:Pending = $false
 
+Write-Host "`n===== AN UPDATE IS DOWNLOADED BUT NOT INSTALLED YET =====" -ForegroundColor White
+# Seen on a real PC: 9 GB of a downloaded update were removed, then Windows downloaded them again.
+function Get-DownloadedUpdates { @('2026-10 Cumulative Update for Windows 11 Version 25H2 for x64-based Systems (KB5070001)') }
+New-FakePC
+$script:Results.Clear()
+$out = (Clear-UpdateCache 6>&1 | Out-String)
+Check ((Test-Path "$Sandbox/Windows/SoftwareDistribution/Download/abc/windows11.0-kb1.cab") -and @($script:Results | Where-Object { $_.Category -eq 'Windows Update cache' }).Count -eq 0) 'its download cache is kept'
+Check ($out -match 'has downloaded updates it has not installed yet \(2026-10 Cumulative Update' -and $out -match 'Settings > Windows Update') 'YSO says why, names the update, and what to do'
+Check (@($script:Results | Where-Object { $_.Category -eq 'Delivery Optimization' }).Count -eq 1) 'Delivery Optimization is still cleaned'
+$script:Results.Clear(); $script:DryRun = $true
+$out = (Clear-UpdateCache 6>&1 | Out-String)
+$script:DryRun = $false
+Check (@($script:Results | Where-Object { $_.Category -eq 'Windows Update cache' }).Count -eq 0 -and $out -match 'not installed yet') 'Analyze does not count it as space you can free'
+function Get-DownloadedUpdates { @() }
+$script:Results.Clear()
+[void](Clear-UpdateCache 6>&1 | Out-String)
+Check (-not (Test-Path "$Sandbox/Windows/SoftwareDistribution/Download/abc/windows11.0-kb1.cab")) 'nothing waiting: the cache is cleaned as before'
+
 Write-Host "`n===== WHAT CLEANING NEVER REMOVES IS SHOWN =====" -ForegroundColor White
 New-FakePC
 $script:Lang = 'fr'

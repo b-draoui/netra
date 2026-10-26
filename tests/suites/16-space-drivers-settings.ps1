@@ -62,6 +62,13 @@ Check (@($paths | Where-Object { $_ -match 'SomeGame|Notes|node_modules|DeepApp'
 Check (@($paths | Where-Object { $_ -match 'discord|LinkToSlack' }).Count -eq 0) 'apps already cleaned by name and folder links are not counted twice'
 Check ((@($script:DetectedApps) -join ',') -eq 'Slack,WhatsApp') "named after their folder: $($script:DetectedApps -join ', ')"
 Check ((Get-AppNameFromPath "$L/Packages/MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy/LocalState/EBWebView" $L) -eq 'Windows widgets' -and (Get-AppNameFromPath "$L/Packages/Some.Vendor.CoolApp_abc/LocalCache" $L) -eq 'CoolApp') 'Windows parts get a readable name (seen on real Windows 11: Start and widgets)'
+$names = @(
+    @("$L/ollama app.exe/EBWebView", 'Ollama'), @("$L/Microsoft/Olk/EBWebView", 'Outlook'),
+    @("$L/Packages/Microsoft.WindowsStore_8wekyb3d8bbwe/LocalCache", 'Microsoft Store'),
+    @("$L/Packages/windows.immersivecontrolpanel_cw5n1h2txyewy/LocalState", 'Windows Settings'),
+    @("$L/Microsoft/Windows/Widgets/EBWebView", 'Windows Widgets'), @("$L/pgadmin4/Default", 'Pgadmin4'), @("$L/Claude/Default", 'Claude'))
+$bad = @($names | Where-Object { (Get-AppNameFromPath $_[0] $L) -ne $_[1] } | ForEach-Object { "$($_[1]) <> $(Get-AppNameFromPath $_[0] $L)" })
+Check ($bad.Count -eq 0) "readable names for apps seen on real PCs: Ollama, Outlook, Microsoft Store, Windows Settings... ($($bad -join '; '))"
 
 $script:Results.Clear()
 $script:DryRun = $true; Clear-DevAppCaches -NoPrompt 6>$null; $script:DryRun = $false
