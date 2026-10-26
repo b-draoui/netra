@@ -4857,6 +4857,15 @@ function Invoke-SelfTest {
         if (Get-Command -Name 'Delete-DeliveryOptimizationCache' -ErrorAction SilentlyContinue) { Result-Ok }
         else { Result-Missing (L 'not on this Windows version - that part is skipped') }
     }
+    Test-Check 'Clean' 'Updates downloaded, not installed yet (4)' {
+        # the question asked before the Windows Update cache is cleaned (no internet needed)
+        $searcher = (New-UpdateSession).CreateUpdateSearcher()
+        $searcher.Online = $false
+        $found = $searcher.Search("IsInstalled=0 and IsHidden=0")
+        $n = 0
+        for ($i = 0; $i -lt $found.Updates.Count; $i++) { if ($found.Updates.Item($i).IsDownloaded) { $n++ } }
+        Result-Ok (L '{0} waiting: the cache is kept while there are any' $n)
+    }
     Test-Check 'Clean' 'Recycle Bin (5)' {
         if (-not (Get-Command -Name 'Clear-RecycleBin' -ErrorAction SilentlyContinue)) { return (Result-Broken (L 'missing: {0}' 'Clear-RecycleBin')) }
         Result-Ok (Format-Size (Get-RecycleBinBytes))
@@ -8846,6 +8855,8 @@ YSO is busy ==> YSO est occupé
 YSO is installed: Start menu, Desktop, and Settings > Apps > Installed apps (to uninstall it). ==> YSO est installé : menu Démarrer, Bureau, et Paramètres > Applications > Applications installées (pour le désinstaller).
 YSO was uninstalled. ==> YSO a été désinstallé.
 Your answer is needed below. ==> Votre réponse est attendue ci-dessous.
+{0} waiting: the cache is kept while there are any ==> {0} en attente : le cache est gardé tant qu'il y en a
+Updates downloaded, not installed yet (4) ==> Mises à jour téléchargées, pas encore installées (4)
 (and {0} more) ==> (et {0} autre(s))
 Windows Update has downloaded updates it has not installed yet ({0}): its download cache is kept, or Windows would download them again. Install them (Settings > Windows Update), then clean again. ==> Windows Update a téléchargé des mises à jour qu'il n'a pas encore installées ({0}) : son cache de téléchargement est gardé, sinon Windows les retéléchargerait. Installez-les (Paramètres > Windows Update), puis nettoyez à nouveau.
 Updates are waiting for a restart: the Windows Update download cache would be kept. ==> Des mises à jour attendent un redémarrage : le cache de téléchargement de Windows Update serait gardé.
